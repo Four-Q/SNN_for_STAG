@@ -1,0 +1,44 @@
+# Python 解释器缓存与构建产物
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+build/
+dist/
+*.egg-info/
+
+# Python 虚拟环境
+.venv/
+venv/
+env/
+.conda/
+
+# Jupyter 临时文件
+.ipynb_checkpoints/
+
+# 编辑器与操作系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# STAG 原始数据不进入 Git；目录本身用 .gitkeep 保留
+stag_data/*
+!stag_data/.gitkeep
+
+# 训练模型、实验记录和图表由 notebook 运行后生成
+code/outputs/*
+!code/outputs/.gitkeep
+*.pt
+*.pth
+*.ckpt
+
+# 项目内临时分析与渲染文件
+tmp/
+
+# 测试和覆盖率缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
