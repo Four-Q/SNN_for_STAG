@@ -106,6 +106,46 @@ def set_random_seed(seed: int = 42, deterministic: bool = True) -> None:
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+
+def configure_cuda_performance(
+    device: torch.device,
+    deterministic: bool = False,
+    allow_tf32: bool = True,
+) -> None:
+    """为固定输入形状的 CUDA 训练启用高吞吐后端设置。
+
+    ``deterministic=False`` 会让 cuDNN 为卷积自动选择更快的算法。TF32 只影响
+    未被混合精度覆盖的 float32 矩阵乘法和卷积；需要逐位复现时应关闭这两个
+    优化。
+    """
+
+    if device.type != "cuda":
+        return
+
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+
+
+def recommended_num_workers(max_workers: int = 8) -> int:
+    """根据平台返回保守的 DataLoader worker 数。
+
+    Linux 使用 ``fork`` 时可共享只读的 STAG 压力数组；Windows 使用 ``spawn``
+    会复制这块大数组，因此仍默认单进程加载。
+    """
+
+    if max_workers < 0:
+        raise ValueError("max_workers 不能为负数。")
+    if os.name == "nt" or max_workers == 0:
+        return 0
+    cpu_count = os.cpu_count() or 1
+    return min(max_workers, max(1, cpu_count - 1))
 
 
 def seed_worker(worker_id: int) -> None:
@@ -147,15 +187,25 @@ def train_one_epoch(
     device: torch.device,
     num_classes: int,
     grad_clip: float | None = 1.0,
+    amp_dtype: torch.dtype | None = None,
+    progress_loss_interval: int = 0,
     show_progress: bool = True,
 ) -> EvaluationResult:
-    """训练一个 epoch，并确保每个批次后重置所有 SNN 状态。"""
+    """训练一个 epoch，并确保每个批次后重置所有 SNN 状态。
+
+    指标张量会留在设备上，直到 epoch 结束后才一次性复制到 CPU，避免每个
+    batch 的 ``item()``/``cpu()`` 强制同步 CUDA。``progress_loss_interval``
+    大于 0 时才会按指定批次数刷新一次 loss。
+    """
+
+    if progress_loss_interval < 0:
+        raise ValueError("progress_loss_interval 不能为负数。")
 
     model.train()
-    total_loss = 0.0
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
     sample_count = 0
-    all_targets: list[np.ndarray] = []
-    all_predictions: list[np.ndarray] = []
+    all_targets: list[torch.Tensor] = []
+    all_predictions: list[torch.Tensor] = []
 
     iterator = tqdm(
         data_loader,
@@ -163,14 +213,19 @@ def train_one_epoch(
         leave=False,
         disable=not show_progress,
     )
-    for batch in iterator:
+    for batch_index, batch in enumerate(iterator, start=1):
         x = batch["x"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
         try:
-            logits = model(x)
-            loss = criterion(logits, y)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_dtype is not None,
+            ):
+                logits = model(x)
+                loss = criterion(logits, y)
             loss.backward()
             if grad_clip is not None:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -180,18 +235,26 @@ def train_one_epoch(
             functional.reset_net(model)
 
         batch_size = y.numel()
-        total_loss += float(loss.detach().item()) * batch_size
+        total_loss += loss.detach().float() * batch_size
         sample_count += batch_size
         prediction = logits.detach().argmax(dim=1)
-        all_targets.append(y.detach().cpu().numpy())
-        all_predictions.append(prediction.cpu().numpy())
-        iterator.set_postfix(loss=f"{loss.detach().item():.4f}")
+        all_targets.append(y.detach())
+        all_predictions.append(prediction)
+        if (
+            progress_loss_interval > 0
+            and batch_index % progress_loss_interval == 0
+        ):
+            iterator.set_postfix(
+                loss=f"{loss.detach().float().item():.4f}"
+            )
 
+    targets = torch.cat(all_targets).cpu().numpy()
+    predictions = torch.cat(all_predictions).cpu().numpy()
     accuracy, macro_f1, matrix = _batch_metrics(
-        all_targets, all_predictions, num_classes
+        [targets], [predictions], num_classes
     )
     return EvaluationResult(
-        loss=total_loss / sample_count,
+        loss=float(total_loss.item()) / sample_count,
         accuracy=accuracy,
         macro_f1=macro_f1,
         sample_count=sample_count,
@@ -206,15 +269,16 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
     num_classes: int,
+    amp_dtype: torch.dtype | None = None,
     show_progress: bool = True,
 ) -> EvaluationResult:
     """在验证集或测试集上评估，并在每个批次后重置 SNN 状态。"""
 
     model.eval()
-    total_loss = 0.0
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
     sample_count = 0
-    all_targets: list[np.ndarray] = []
-    all_predictions: list[np.ndarray] = []
+    all_targets: list[torch.Tensor] = []
+    all_predictions: list[torch.Tensor] = []
 
     iterator = tqdm(
         data_loader,
@@ -227,23 +291,30 @@ def evaluate(
         y = batch["y"].to(device, non_blocking=True)
 
         try:
-            logits = model(x)
-            loss = criterion(logits, y)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_dtype is not None,
+            ):
+                logits = model(x)
+                loss = criterion(logits, y)
         finally:
             functional.reset_net(model)
 
         batch_size = y.numel()
-        total_loss += float(loss.item()) * batch_size
+        total_loss += loss.float() * batch_size
         sample_count += batch_size
         prediction = logits.argmax(dim=1)
-        all_targets.append(y.cpu().numpy())
-        all_predictions.append(prediction.cpu().numpy())
+        all_targets.append(y)
+        all_predictions.append(prediction)
 
+    targets = torch.cat(all_targets).cpu().numpy()
+    predictions = torch.cat(all_predictions).cpu().numpy()
     accuracy, macro_f1, matrix = _batch_metrics(
-        all_targets, all_predictions, num_classes
+        [targets], [predictions], num_classes
     )
     return EvaluationResult(
-        loss=total_loss / sample_count,
+        loss=float(total_loss.item()) / sample_count,
         accuracy=accuracy,
         macro_f1=macro_f1,
         sample_count=sample_count,
@@ -399,4 +470,3 @@ def configure_windows_dataloader_defaults() -> None:
 
     if os.name != "nt":
         return
-

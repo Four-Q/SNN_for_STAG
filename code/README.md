@@ -89,7 +89,24 @@ python -m pip install -r requirements.txt
 
 ## 显存与 DataLoader
 
-当前机器的 NVIDIA MX450 只有 2 GB 显存，默认 batch size 为 16。若发生显存
-不足，只需在训练 notebook 中把它降到 8 或 4。Windows 下默认
-`num_workers=0`，避免 DataLoader 子进程复制完整压力数组。
+若在只有 2 GB 显存的 NVIDIA MX450 上运行，请把训练 notebook 的 batch size
+从远程训练默认值降到 16、8 或 4。Windows 下默认 `num_workers=0`，避免
+DataLoader 子进程复制完整压力数组。
 
+## RTX PRO 6000 训练加速
+
+训练 notebook 会按平台自动选择更合适的高吞吐设置：
+
+- RTX PRO 6000 默认从 `BATCH_SIZE=256` 开始，可在显存有余量时继续测试
+  `512`；以每轮输出的 `samples/s` 判断真实加速，不只看监控面板的瞬时利用率。
+- CUDA 自动使用 BF16、TF32、cuDNN autotune 和 fused AdamW；把
+  `DETERMINISTIC=True` 可恢复更严格的复现设置，但会牺牲部分速度。
+- Linux 默认使用最多 8 个 DataLoader worker、持久 worker 和预取；Windows
+  仍使用单进程，避免 `spawn` 复制大数组。
+- 全部压力帧会一次性归一化成共享的 float32 缓存，约占 0.52 GiB 主机内存，
+  避免重叠窗口在每个 epoch 重复做归一化。
+- 训练指标在 GPU 上累计，到 epoch 末才统一传回 CPU，从而避免逐 batch
+  `.item()` 和进度条刷新造成的 CUDA 同步。
+
+增大 batch size 会改变优化轨迹，因此加速前后应同时比较验证准确率与
+`samples/s`。若准确率下降，可先试 `BATCH_SIZE=128`，或相应增加训练 epoch。
