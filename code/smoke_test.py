@@ -77,7 +77,7 @@ def main() -> None:
         assert summary["full_train_samples"] == 35_178
         assert summary["full_validation_samples"] == 15_522
         assert summary["validation_uses_official_test"] is True
-        assert "selection bias" in summary["validation_warning"].lower()
+        assert "选择偏差" in summary["validation_warning"]
 
         mapping = json.loads(
             (output_dir / "class_mapping.json").read_text(encoding="utf-8")
@@ -110,8 +110,8 @@ def main() -> None:
             assert np.isfinite(image).all()
 
     print(
-        "Smoke test passed: notebook execution, real STAG data, one training/"
-        "validation epoch, checkpoints, metrics, and English plots are valid."
+        "冒烟测试通过：Notebook 无界面执行、真实 STAG 数据、一次训练/验证、"
+        "模型文件、指标文件和英文图表均正常。"
     )
 
 
