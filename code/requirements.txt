@@ -1,4 +1,4 @@
-# PyTorch 的 CUDA/CPU 构建可按机器环境选择；本项目使用以下 API 版本范围。
+# PyTorch 的 CUDA/CPU 构建可按训练机器环境选择。
 torch==2.7.1
 spikingjelly==0.0.0.0.14
 numpy>=1.26,<3
@@ -7,7 +7,6 @@ pandas>=2,<3
 matplotlib>=3.8,<4
 seaborn>=0.13,<1
 scikit-learn>=1.4,<2
-tqdm>=4.66,<5
 jupyterlab>=4,<5
 nbformat>=5.9,<6
 nbclient>=0.8,<1

@@ -1,112 +1,68 @@
-# STAG 连续时序 Conv-SNN
+# STAG 单帧压力图 Conv-SNN
 
-本目录提供一套以 recording 为单位构建 STAG 连续触觉窗口，并使用
-PyTorch + SpikingJelly 训练卷积脉冲神经网络的清晰基线。
+本目录提供一套易于顺序阅读的单帧物体识别基线。每个样本只包含一张
+`1×32×32` 压力图；模型内部生成的 16 个泊松时间步是 SNN 仿真时间，
+不是 16 张连续触觉帧。
 
-代码不会解压或改写原始数据。它直接读取：
+## 数据口径
 
-```text
-../stag_data/classification_lite.zip
-```
+- 直接读取 `../stag_data/classification_lite.zip` 中的 `metadata.mat`，不解压。
+- 使用官方 `splitId` 和 `isBalanced` 标记，不随机打散相邻帧。
+- 按当前实验要求移除 `empty_hand`，识别 26 个真实物体。
+- 完整训练集为 35,178 帧（每类 1,353），验证集为 15,522 帧（每类 597）。
+- 压力归一化为 `clip((x-500)/(650-500), 0, 1)`，并清零无效传感器位置。
 
-## 重要实验说明
-
-按照当前实验要求，官方测试集会在每个 epoch 后参与评估，并用于早停和选择
-`best_model.pt`。因此它实际承担了验证集的角色，最佳测试准确率存在模型选择
-偏倚，不能再视为严格独立、无偏的最终测试结果。`train_stag_snn.ipynb`、
-checkpoint 和 `summary.json` 都会保留这一说明。
+需要特别注意：官方 `test` 在 notebook 中按当前要求被用作每个 epoch 的
+validation，并参与 `best_model.pt` 选择。因此最佳验证准确率存在模型选择偏差，
+不能被描述为无偏的最终测试结果。
 
 ## 文件职责
 
-- `stag_data.py`：读取 ZIP/MAT、推导 548 点掩码、检测连续片段、生成窗口清单。
-- `stag_dataset.py`：按清单动态读取窗口并归一化为 PyTorch Tensor。
-- `snn_model.py`：多步 Conv-SNN 模型。
-- `train_utils.py`：训练、评估、早停、指标和实验文件保存。
-- `visualization.py`：数据分布、触觉帧、训练曲线和混淆矩阵。
-- `stag_explore.ipynb`：只探索数据，不包含训练逻辑。
-- `train_stag_snn.ipynb`：参数、训练过程、测试早停和结果可视化。
-- `smoke_test.py`：不进行正式训练的真实数据小批次检查。
+- `data.py`：ZIP/MAT 读取、官方单帧划分、传感器掩码与 Dataset。
+- `model.py`：泊松编码和三层轻量 Conv-SNN。
+- `train_single_frame_snn.ipynb`：训练、验证、可视化和模型保存的唯一入口。
+- `smoke_test.py`：无界面执行 notebook 的 smoke 模式并检查全部产物。
 
-## 安装依赖
+## 安装
 
-建议在独立 Python 3.11 环境中安装。若要使用 NVIDIA GPU，优先按
-[PyTorch 官方安装页](https://pytorch.org/get-started/locally/)选择与 CUDA
-匹配的安装命令，然后安装其余依赖：
+建议使用 Python 3.11。若使用 NVIDIA GPU，应先按 PyTorch 官方说明安装与
+CUDA 匹配的 PyTorch，再安装其余依赖：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-代码固定使用 PyPI 稳定版 `spikingjelly==0.0.0.0.14` 的
-`spikingjelly.activation_based` 接口，不需要 CuPy。
+## 冒烟测试
 
-## 推荐运行顺序
+```powershell
+python smoke_test.py
+```
 
-1. 打开并逐节运行 `stag_explore.ipynb`，理解字段、recording、掩码和断点。
-2. 执行安全冒烟测试：
+该测试读取真实 STAG 数据，以 CPU、少量样本、两个 SNN 时间步运行一个
+训练/验证 epoch，并在临时目录检查 checkpoint、CSV、JSON 和三张英文图表。
+它不会修改已提交 notebook，也不会进行完整训练。
 
-   ```powershell
-   python smoke_test.py
-   ```
+## 完整训练
 
-3. 打开 `train_stag_snn.ipynb`。默认 `RUN_TRAINING = False`，整本 notebook
-   只会加载数据并执行一个真实批次前向检查。
-4. 确认路径和显存后，将 `RUN_TRAINING` 改为 `True`，再运行训练单元。
+打开 `train_single_frame_snn.ipynb`，将配置单元中的：
 
-## 默认数据定义
+```python
+RUN_MODE = "full"
+```
 
-- 过滤 `empty_hand`，分类标签为 26 个真实物体。
-- 官方 `splitId=0` 为训练，`splitId=1` 为测试。
-- 窗口长度 16、步长 8。
-- `interaction` 模式要求窗口的 `hasValidLabel` 比例不低于 0.5。
-- 归一化为 `clip((x-500)/(650-500), 0, 1)`。
-- 大于 950 的异常压力帧会成为断点。
-- 帧号跳跃、时间戳不递增或时间间隔过大也会成为断点。
+然后按顺序运行全部单元。完整模式默认参数为：
 
-当前数据包在默认配置下应生成：
+- 200 epochs
+- batch size 32
+- Adam，learning rate `1e-3`
+- 训练压力图高斯噪声标准差 `0.015`
+- 16 个泊松 SNN 仿真时间步
 
-| 划分 | recording | 窗口 |
-|---|---:|---:|
-| train | 52 | 8,315 |
-| test | 26 | 3,352 |
+结果写入 `outputs/single_frame_full/`，包括：
 
-切换到 `mode="stable"` 后，只保留全部 16 帧均有效的窗口。
+- `best_model.pt`、`last_model.pt`
+- `history.csv`、`summary.json`、`class_mapping.json`
+- `training_curves.png`、`confusion_matrix.png`、`class_accuracy.png`
 
-## 输出文件
-
-正式训练会写入 `outputs/<EXPERIMENT_NAME>/`：
-
-- `config.json`：完整参数和测试集参与早停的说明；
-- `class_mapping.json`：模型标签与原始 `objectId`；
-- `train_windows.csv`、`test_windows.csv`：窗口索引清单；
-- `history.csv`：每轮训练/测试的 loss、accuracy、macro-F1；
-- `best_model.pt`：测试准确率最高、同分时测试损失最低的 checkpoint；
-- `last_model.pt`：停止训练时的 checkpoint；
-- `summary.json`：最佳 epoch、早停状态和最终指标；
-- `training_curves.png`、`confusion_matrix.png`：结果图。
-
-窗口 CSV 不含压力矩阵，因此不会重复保存大量相邻帧。
-
-## 显存与 DataLoader
-
-若在只有 2 GB 显存的 NVIDIA MX450 上运行，请把训练 notebook 的 batch size
-从远程训练默认值降到 16、8 或 4。Windows 下默认 `num_workers=0`，避免
-DataLoader 子进程复制完整压力数组。
-
-## RTX PRO 6000 训练加速
-
-训练 notebook 会按平台自动选择更合适的高吞吐设置：
-
-- RTX PRO 6000 默认从 `BATCH_SIZE=256` 开始，可在显存有余量时继续测试
-  `512`；以每轮输出的 `samples/s` 判断真实加速，不只看监控面板的瞬时利用率。
-- CUDA 自动使用 BF16、TF32、cuDNN autotune 和 fused AdamW；把
-  `DETERMINISTIC=True` 可恢复更严格的复现设置，但会牺牲部分速度。
-- Linux 默认使用最多 8 个 DataLoader worker、持久 worker 和预取；Windows
-  仍使用单进程，避免 `spawn` 复制大数组。
-- 全部压力帧会一次性归一化成共享的 float32 缓存，约占 0.52 GiB 主机内存，
-  避免重叠窗口在每个 epoch 重复做归一化。
-- 训练指标在 GPU 上累计，到 epoch 末才统一传回 CPU，从而避免逐 batch
-  `.item()` 和进度条刷新造成的 CUDA 同步。
-
-增大 batch size 会改变优化轨迹，因此加速前后应同时比较验证准确率与
-`samples/s`。若准确率下降，可先试 `BATCH_SIZE=128`，或相应增加训练 epoch。
+这是一套遵循论文单帧数据协议的轻量 SNN 基线，并非论文 ResNet 架构或论文
+27 类准确率的严格复现。

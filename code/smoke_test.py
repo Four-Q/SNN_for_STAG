@@ -1,166 +1,125 @@
-"""真实 STAG 数据与 Conv-SNN 的非正式训练冒烟测试。
-
-该脚本只使用两个样本完成一次前向和反向，不遍历训练集、不执行任何 epoch，
-也不会在 outputs 中保存模型。
-"""
+"""无界面执行单帧 SNN notebook 的 smoke 模式并验证输出产物。"""
 
 from __future__ import annotations
 
-import argparse
+import asyncio
+import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 
+import nbformat
+import numpy as np
+import pandas as pd
 import torch
-from spikingjelly.activation_based import functional
-from torch import nn
-from torch.utils.data import DataLoader, Subset
+from matplotlib import image as mpimg
+from nbclient import NotebookClient
 
-from snn_model import ConvSNNClassifier
-from stag_data import (
-    build_window_index,
-    load_stag_metadata,
-    validate_window_manifest,
+
+EXPECTED_FILES = (
+    "best_model.pt",
+    "last_model.pt",
+    "history.csv",
+    "summary.json",
+    "class_mapping.json",
+    "training_curves.png",
+    "confusion_matrix.png",
+    "class_accuracy.png",
 )
-from stag_dataset import STAGSequenceDataset, compute_class_weights
-from train_utils import (
-    EarlyStopping,
-    evaluate,
-    set_random_seed,
-    train_one_epoch,
-)
-
-
-def parse_args() -> argparse.Namespace:
-    default_zip = (
-        Path(__file__).resolve().parent.parent
-        / "stag_data"
-        / "classification_lite.zip"
-    )
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--zip-path",
-        type=Path,
-        default=default_zip,
-        help="classification_lite.zip 路径",
-    )
-    return parser.parse_args()
-
-
-def check_early_stopping() -> None:
-    """覆盖首次提升、准确率同分损失降低和 patience 用尽。"""
-
-    stopper = EarlyStopping(patience=2)
-    improved, should_stop = stopper.step(0.50, 1.00, epoch=1)
-    assert improved and not should_stop and stopper.best_epoch == 1
-
-    improved, should_stop = stopper.step(0.50, 0.90, epoch=2)
-    assert improved and not should_stop and stopper.best_epoch == 2
-
-    improved, should_stop = stopper.step(0.49, 0.80, epoch=3)
-    assert not improved and not should_stop
-    improved, should_stop = stopper.step(0.48, 0.70, epoch=4)
-    assert not improved and should_stop
 
 
 def main() -> None:
-    args = parse_args()
-    set_random_seed(42)
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    print("1/5 读取 metadata.mat 并推导传感器掩码……")
-    metadata = load_stag_metadata(args.zip_path)
-    assert metadata.num_frames == 135_187
-    assert metadata.num_recordings == 82
-    assert metadata.num_objects == 27
-    assert int(metadata.sensor_mask.sum()) == 548
+    code_dir = Path(__file__).resolve().parent
+    notebook_path = code_dir / "train_single_frame_snn.ipynb"
+    if not notebook_path.is_file():
+        raise FileNotFoundError(f"找不到 notebook：{notebook_path}")
 
-    print("2/5 构建并逐窗口验证默认时序清单……")
-    window_index = build_window_index(
-        metadata,
-        window_size=16,
-        stride=8,
-        mode="interaction",
-        min_valid_ratio=0.5,
-    )
-    train_manifest = window_index.split_manifest("train")
-    test_manifest = window_index.split_manifest("test")
-    assert len(window_index.class_names) == 26
-    assert len(train_manifest) == 8_315
-    assert len(test_manifest) == 3_352
-    assert train_manifest["recording_id"].nunique() == 52
-    assert test_manifest["recording_id"].nunique() == 26
-    assert set(train_manifest["recording_id"]).isdisjoint(
-        set(test_manifest["recording_id"])
-    )
-    validate_window_manifest(metadata, window_index)
+    with tempfile.TemporaryDirectory(prefix="stag_single_frame_smoke_") as tmp:
+        temp_dir = Path(tmp)
+        old_cwd = Path.cwd()
+        old_run_mode = os.environ.get("SNN_RUN_MODE")
+        old_output_root = os.environ.get("SNN_OUTPUT_ROOT")
+        os.environ["SNN_RUN_MODE"] = "smoke"
+        os.environ["SNN_OUTPUT_ROOT"] = str(temp_dir)
 
-    print("3/5 读取两个真实训练窗口……")
-    train_dataset = STAGSequenceDataset(
-        metadata,
-        train_manifest,
-        window_index.recording_indices,
-    )
-    # 只取两个样本，确保 train_one_epoch 只运行一个批次。
-    tiny_dataset = Subset(train_dataset, [0, 1])
-    loader = DataLoader(tiny_dataset, batch_size=2, shuffle=False)
-    batch = next(iter(loader))
-    assert tuple(batch["x"].shape) == (2, 16, 1, 32, 32)
-    assert tuple(batch["y"].shape) == (2,)
-    assert torch.isfinite(batch["x"]).all()
-    assert batch["x"].min() >= 0 and batch["x"].max() <= 1
-
-    print("4/5 执行一次 Conv-SNN 前向、反向、评估和参数更新……")
-    model = ConvSNNClassifier(num_classes=26)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    class_weights = compute_class_weights(train_manifest, 26)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-    # 先明确检查公开 forward 接口的输出形状。
-    with torch.no_grad():
         try:
-            logits = model(batch["x"])
+            os.chdir(code_dir)
+            notebook = nbformat.read(notebook_path, as_version=4)
+            executed = NotebookClient(
+                notebook,
+                timeout=600,
+                kernel_name="python3",
+                allow_errors=False,
+            ).execute()
+            nbformat.write(executed, temp_dir / "executed_smoke.ipynb")
         finally:
-            functional.reset_net(model)
-    assert tuple(logits.shape) == (2, 26)
+            os.chdir(old_cwd)
+            _restore_environment("SNN_RUN_MODE", old_run_mode)
+            _restore_environment("SNN_OUTPUT_ROOT", old_output_root)
 
-    train_result = train_one_epoch(
-        model,
-        loader,
-        criterion,
-        optimizer,
-        torch.device("cpu"),
-        num_classes=26,
-        show_progress=False,
-    )
-    test_result = evaluate(
-        model,
-        loader,
-        criterion,
-        torch.device("cpu"),
-        num_classes=26,
-        show_progress=False,
-    )
-    assert np_is_finite(train_result.loss)
-    assert np_is_finite(test_result.loss)
-    assert train_result.confusion_matrix.shape == (26, 26)
-    assert test_result.confusion_matrix.shape == (26, 26)
+        output_dir = temp_dir / "single_frame_smoke"
+        missing = [
+            name for name in EXPECTED_FILES if not (output_dir / name).is_file()
+        ]
+        if missing:
+            raise AssertionError(f"smoke 模式缺少输出文件：{missing}")
 
-    # 再检查一次手动重置不会报错。
-    try:
-        _ = model(batch["x"])
-    finally:
-        functional.reset_net(model)
+        summary = json.loads(
+            (output_dir / "summary.json").read_text(encoding="utf-8")
+        )
+        assert summary["run_mode"] == "smoke"
+        assert summary["num_frames"] == 135_187
+        assert summary["num_classes"] == 26
+        assert summary["full_train_samples"] == 35_178
+        assert summary["full_validation_samples"] == 15_522
+        assert summary["validation_uses_official_test"] is True
+        assert "selection bias" in summary["validation_warning"].lower()
 
-    print("5/5 验证早停状态机……")
-    check_early_stopping()
+        mapping = json.loads(
+            (output_dir / "class_mapping.json").read_text(encoding="utf-8")
+        )
+        assert len(mapping) == 26
+        assert all(row["name"] != "empty_hand" for row in mapping)
+
+        history = pd.read_csv(output_dir / "history.csv")
+        assert len(history) == 1
+        numeric = history.select_dtypes(include=[np.number]).to_numpy()
+        assert np.isfinite(numeric).all()
+
+        for checkpoint_name in ("best_model.pt", "last_model.pt"):
+            checkpoint = torch.load(
+                output_dir / checkpoint_name,
+                map_location="cpu",
+                weights_only=False,
+            )
+            assert checkpoint["model_config"]["num_classes"] == 26
+            assert checkpoint["class_names"] == summary["class_names"]
+
+        for image_name in (
+            "training_curves.png",
+            "confusion_matrix.png",
+            "class_accuracy.png",
+        ):
+            image = mpimg.imread(output_dir / image_name)
+            assert image.ndim in (2, 3)
+            assert image.shape[0] > 10 and image.shape[1] > 10
+            assert np.isfinite(image).all()
+
     print(
-        "冒烟测试通过：真实数据读取、8315/3352 窗口、模型前向/反向、"
-        "状态重置和早停逻辑均正常。"
+        "Smoke test passed: notebook execution, real STAG data, one training/"
+        "validation epoch, checkpoints, metrics, and English plots are valid."
     )
 
 
-def np_is_finite(value: float) -> bool:
-    """避免仅为一个标量额外导入 NumPy。"""
-
-    return value == value and value not in (float("inf"), float("-inf"))
+def _restore_environment(name: str, previous: str | None) -> None:
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
 
 
 if __name__ == "__main__":
