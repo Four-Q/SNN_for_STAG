@@ -53,10 +53,33 @@ RUN_MODE = "full"
 然后按顺序运行全部单元。完整模式默认参数为：
 
 - 200 epochs
-- batch size 32
+- RTX PRO 6000 上默认 batch size 512
+- 验证默认使用 batch size 1024
 - Adam，learning rate `1e-3`
 - 训练压力图高斯噪声标准差 `0.015`
 - 16 个泊松 SNN 仿真时间步
+
+## Linux RTX PRO 6000 加速
+
+完整模式会针对 Linux 高性能 GPU 自动启用：
+
+- 最多 8 个持久化 DataLoader worker、固定内存和 4 倍预取；
+- 一次性矢量化归一化缓存，训练期间不再逐样本处理压力图；
+- BF16 自动混合精度、TF32、cuDNN autotune 和 fused Adam；
+- GPU 上累计整轮指标，仅在 epoch 末传回 CPU；
+- 训练与验证分别显示 `tqdm` 进度条，每隔若干批次刷新一次 loss。
+
+RTX PRO 6000 默认从 batch size 512 开始。若显存不足，可在 Notebook 配置
+单元中改小，或在启动前设置环境变量：
+
+```bash
+export SNN_BATCH_SIZE=256
+export SNN_VALIDATION_BATCH_SIZE=512
+export SNN_NUM_WORKERS=8
+```
+
+若显存仍有大量余量，可以尝试 `SNN_BATCH_SIZE=768` 或 `1024`。应以每轮耗时
+和 `nvidia-smi` 的持续利用率判断吞吐提升，而不是只观察瞬时峰值。
 
 结果写入 `outputs/single_frame_full/`，包括：
 

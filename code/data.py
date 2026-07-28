@@ -272,7 +272,11 @@ def _validate_frame_splits(
 
 
 class STAGSingleFrameDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    """返回一张归一化压力图 ``[1, 32, 32]`` 及其类别标签。"""
+    """从内存缓存返回一张归一化压力图及其类别标签。
+
+    Dataset 初始化时会一次性矢量化处理全部选中帧。训练期间的
+    ``__getitem__`` 只建立 Tensor 视图，不再逐样本转换和归一化。
+    """
 
     def __init__(
         self,
@@ -287,35 +291,39 @@ class STAGSingleFrameDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         if len(frame_indices) == 0:
             raise ValueError("frame_indices 不能为空。")
 
-        self.metadata = metadata
         self.frame_indices = np.asarray(frame_indices, dtype=np.int64)
         self.original_to_label = np.asarray(
             original_to_label, dtype=np.int64
         )
-        self.pressure_min = float(pressure_min)
-        self.pressure_max = float(pressure_max)
         self.labels = self.original_to_label[
             metadata.object_id[self.frame_indices]
         ]
         if np.any(self.labels < 0):
             raise ValueError("Dataset 中包含未映射类别。")
 
+        # 一次性缓存连续 float32 数组，避免每个 epoch 重复进行逐样本归一化。
+        images = metadata.pressure[self.frame_indices].astype(
+            np.float32, copy=True
+        )
+        images -= float(pressure_min)
+        images /= float(pressure_max - pressure_min)
+        np.clip(images, 0.0, 1.0, out=images)
+        images *= metadata.sensor_mask[None, :, :]
+        self.images = np.ascontiguousarray(images)
+
     def __len__(self) -> int:
         return len(self.frame_indices)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        global_index = int(self.frame_indices[index])
-        pressure = self.metadata.pressure[global_index].astype(
-            np.float32, copy=True
-        )
-        pressure -= self.pressure_min
-        pressure /= self.pressure_max - self.pressure_min
-        np.clip(pressure, 0.0, 1.0, out=pressure)
-        pressure *= self.metadata.sensor_mask
-
-        image = torch.from_numpy(pressure).unsqueeze(0)
+        image = torch.from_numpy(self.images[index]).unsqueeze(0)
         label = torch.tensor(int(self.labels[index]), dtype=torch.long)
         return image, label
+
+    @property
+    def cache_size_bytes(self) -> int:
+        """返回归一化图像缓存占用的字节数。"""
+
+        return int(self.images.nbytes)
 
 
 def create_single_frame_datasets(

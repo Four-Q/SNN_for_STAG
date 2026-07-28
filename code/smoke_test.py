@@ -49,6 +49,15 @@ def main() -> None:
         try:
             os.chdir(code_dir)
             notebook = nbformat.read(notebook_path, as_version=4)
+            notebook_source = "\n".join(
+                cell.source
+                for cell in notebook.cells
+                if cell.cell_type == "code"
+            )
+            assert "from tqdm.auto import tqdm" in notebook_source
+            assert "progress_bar = tqdm(" in notebook_source
+            assert 'description=f"训练 {epoch}/{EPOCHS}"' in notebook_source
+            assert 'description=f"验证 {epoch}/{EPOCHS}"' in notebook_source
             executed = NotebookClient(
                 notebook,
                 timeout=600,
@@ -78,6 +87,11 @@ def main() -> None:
         assert summary["full_validation_samples"] == 15_522
         assert summary["validation_uses_official_test"] is True
         assert "选择偏差" in summary["validation_warning"]
+        assert summary["performance_config"]["batch_size"] == 4
+        assert summary["performance_config"]["validation_batch_size"] == 4
+        assert summary["performance_config"]["num_workers"] == 0
+        assert summary["performance_config"]["amp_dtype"] is None
+        assert summary["performance_config"]["fused_adam"] is False
 
         mapping = json.loads(
             (output_dir / "class_mapping.json").read_text(encoding="utf-8")
